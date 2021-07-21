@@ -31,6 +31,8 @@ type Priority int
 const (
 	// Unknown is when there is no status check available
 	Unknown Priority = iota
+	// Obsolete is when a driver has been removed
+	Obsolete
 	// Unhealthy is when a driver does not pass health checks
 	Unhealthy
 	// Experimental is when a driver is not officially supported because it's still experimental
@@ -74,16 +76,22 @@ type StatusChecker func() State
 type State struct {
 	Installed        bool
 	Healthy          bool
-	NeedsImprovement bool // driver is healthy but could be improved
+	Running          bool // it at least appears to be running
+	NeedsImprovement bool // healthy but could be improved
 	Error            error
-	Fix              string
-	Doc              string
+
+	Reason string // A reason ID, propagated to reason.Kind.ID
+	Fix    string
+	Doc    string
 }
 
 // DriverDef defines how to initialize and load a machine driver
 type DriverDef struct {
 	// Name of the machine driver. It has to be unique.
 	Name string
+
+	// Alias contains a list of machine driver aliases. Each alias should also be unique.
+	Alias []string
 
 	// Config is a function that emits a configured driver struct
 	Config Configurator
@@ -93,6 +101,9 @@ type DriverDef struct {
 
 	// Status returns the installation status of the driver
 	Status StatusChecker
+
+	// Default is whether this driver is selected by default or not (opt-in).
+	Default bool
 
 	// Priority returns the prioritization for selecting a driver by default.
 	Priority Priority
@@ -108,13 +119,15 @@ func (d DriverDef) String() string {
 }
 
 type driverRegistry struct {
-	drivers map[string]DriverDef
-	lock    sync.Mutex
+	drivers        map[string]DriverDef
+	driversByAlias map[string]DriverDef
+	lock           sync.RWMutex
 }
 
 func newRegistry() *driverRegistry {
 	return &driverRegistry{
-		drivers: make(map[string]DriverDef),
+		drivers:        make(map[string]DriverDef),
+		driversByAlias: make(map[string]DriverDef),
 	}
 }
 
@@ -128,13 +141,20 @@ func (r *driverRegistry) Register(def DriverDef) error {
 	}
 
 	r.drivers[def.Name] = def
+
+	for _, alias := range def.Alias {
+		if _, ok := r.driversByAlias[alias]; ok {
+			return fmt.Errorf("alias %q is already registered: %+v", alias, def)
+		}
+		r.driversByAlias[alias] = def
+	}
 	return nil
 }
 
 // List returns a list of registered drivers
 func (r *driverRegistry) List() []DriverDef {
-	r.lock.Lock()
-	defer r.lock.Unlock()
+	r.lock.RLock()
+	defer r.lock.RUnlock()
 
 	result := make([]DriverDef, 0, len(r.drivers))
 
@@ -147,7 +167,14 @@ func (r *driverRegistry) List() []DriverDef {
 
 // Driver returns a driver given a name
 func (r *driverRegistry) Driver(name string) DriverDef {
-	r.lock.Lock()
-	defer r.lock.Unlock()
-	return r.drivers[name]
+	r.lock.RLock()
+	defer r.lock.RUnlock()
+
+	def, ok := r.drivers[name]
+	if ok {
+		return def
+	}
+
+	// Check if we have driver def with name as alias
+	return r.driversByAlias[name]
 }

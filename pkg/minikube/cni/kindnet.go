@@ -18,6 +18,7 @@ package cni
 
 import (
 	"bytes"
+	"os/exec"
 	"text/template"
 
 	"github.com/pkg/errors"
@@ -47,6 +48,13 @@ rules:
     verbs:
       - list
       - watch
+      - patch
+  - apiGroups:
+     - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
 ---
 kind: ClusterRoleBinding
 apiVersion: rbac.authorization.k8s.io/v1
@@ -129,7 +137,8 @@ spec:
       volumes:
       - name: cni-cfg
         hostPath:
-          path: /etc/cni/net.d
+          path: {{.CNIConfDir}}
+          type: DirectoryOrCreate
       - name: xtables-lock
         hostPath:
           path: /run/xtables.lock
@@ -157,6 +166,7 @@ func (c KindNet) manifest() (assets.CopyableFile, error) {
 		DefaultRoute: "0.0.0.0/0", // assumes IPv4
 		PodCIDR:      DefaultPodCIDR,
 		ImageName:    images.KindNet(c.cc.KubernetesConfig.ImageRepository),
+		CNIConfDir:   ConfDir,
 	}
 
 	b := bytes.Buffer{}
@@ -168,6 +178,12 @@ func (c KindNet) manifest() (assets.CopyableFile, error) {
 
 // Apply enables the CNI
 func (c KindNet) Apply(r Runner) error {
+	// This is mostly applicable to the 'none' driver
+	_, err := r.RunCmd(exec.Command("stat", "/opt/cni/bin/portmap"))
+	if err != nil {
+		return errors.Wrap(err, "required 'portmap' CNI plug-in not found")
+	}
+
 	m, err := c.manifest()
 	if err != nil {
 		return errors.Wrap(err, "manifest")

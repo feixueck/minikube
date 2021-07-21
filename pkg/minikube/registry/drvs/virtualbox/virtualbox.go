@@ -25,8 +25,8 @@ import (
 
 	"github.com/docker/machine/drivers/virtualbox"
 	"github.com/docker/machine/libmachine/drivers"
-	"github.com/golang/glog"
 
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/minikube/config"
 	"k8s.io/minikube/pkg/minikube/download"
 	"k8s.io/minikube/pkg/minikube/driver"
@@ -43,6 +43,7 @@ func init() {
 		Name:     driver.VirtualBox,
 		Config:   configure,
 		Status:   status,
+		Default:  true,
 		Priority: registry.Fallback,
 		Init:     func() drivers.Driver { return virtualbox.NewDriver("", "") },
 	})
@@ -52,7 +53,7 @@ func init() {
 }
 
 func configure(cc config.ClusterConfig, n config.Node) (interface{}, error) {
-	d := virtualbox.NewDriver(driver.MachineName(cc, n), localpath.MiniPath())
+	d := virtualbox.NewDriver(config.MachineName(cc, n), localpath.MiniPath())
 	d.Boot2DockerURL = download.LocalISOResource(cc.MinikubeISO)
 	d.Memory = cc.Memory
 	d.CPU = cc.CPUs
@@ -73,13 +74,14 @@ func status() registry.State {
 	path, err := exec.LookPath(tryPath)
 	if err != nil {
 		return registry.State{
-			Error: fmt.Errorf("unable to find VBoxManage in $PATH"),
-			Fix:   "Install VirtualBox",
-			Doc:   docURL,
+			Error:     fmt.Errorf("unable to find VBoxManage in $PATH"),
+			Fix:       "Install VirtualBox",
+			Installed: false,
+			Doc:       docURL,
 		}
 	}
 
-	// Allow no more than 2 seconds for querying state
+	// Allow no more than 4 seconds for querying state
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
 
@@ -88,8 +90,8 @@ func status() registry.State {
 
 	// Basic timeout
 	if ctx.Err() == context.DeadlineExceeded {
-		glog.Warningf("%q timed out. ", strings.Join(cmd.Args, " "))
-		return registry.State{Error: err, Installed: true, Healthy: false, Fix: "Restart VirtualBox", Doc: docURL}
+		klog.Warningf("%q timed out. ", strings.Join(cmd.Args, " "))
+		return registry.State{Error: err, Installed: true, Running: false, Healthy: false, Fix: "Restart VirtualBox", Doc: docURL}
 	}
 
 	if exitErr, ok := err.(*exec.ExitError); ok {

@@ -26,15 +26,21 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/docker/machine/libmachine/state"
-	"github.com/shirou/gopsutil/process"
+	"github.com/google/go-cmp/cmp"
+	"github.com/shirou/gopsutil/v3/process"
 	core "k8s.io/api/core/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -85,7 +91,7 @@ func (rr RunResult) Output() string {
 	return sb.String()
 }
 
-// Run is a test helper to log a command being executed \_(ツ)_/¯
+// Run is a test helper to log a command being executed ¯\_(ツ)_/¯
 func Run(t *testing.T, cmd *exec.Cmd) (*RunResult, error) {
 	t.Helper()
 	rr := &RunResult{Args: cmd.Args}
@@ -168,7 +174,9 @@ func Cleanup(t *testing.T, profile string, cancel context.CancelFunc) {
 	// No helper because it makes the call log confusing.
 	if *cleanup {
 		t.Logf("Cleaning up %q profile ...", profile)
-		_, err := Run(t, exec.Command(Target(), "delete", "-p", profile))
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		_, err := Run(t, exec.CommandContext(ctx, Target(), "delete", "-p", profile))
 		if err != nil {
 			t.Logf("failed cleanup: %v", err)
 		}
@@ -312,7 +320,7 @@ func PodWait(ctx context.Context, t *testing.T, profile string, ns string, selec
 	start := time.Now()
 	t.Logf("(dbg) %s: waiting %s for pods matching %q in namespace %q ...", t.Name(), timeout, selector, ns)
 	f := func() (bool, error) {
-		pods, err := client.CoreV1().Pods(ns).List(listOpts)
+		pods, err := client.CoreV1().Pods(ns).List(ctx, listOpts)
 		if err != nil {
 			t.Logf("%s: WARNING: pod list for %q %q returned: %v", t.Name(), ns, selector, err)
 			// Don't return the error upwards so that this is retried, in case the apiserver is rescheduled
@@ -370,6 +378,56 @@ func PodWait(ctx context.Context, t *testing.T, profile string, ns string, selec
 	t.Logf("***** %s: pod %q failed to start within %s: %v ****", t.Name(), selector, timeout, err)
 	showPodLogs(ctx, t, profile, ns, names)
 	return names, fmt.Errorf("%s: %v", fmt.Sprintf("%s within %s", selector, timeout), err)
+}
+
+// PVCWait waits for persistent volume claim to reach bound state
+func PVCWait(ctx context.Context, t *testing.T, profile string, ns string, name string, timeout time.Duration) error {
+	t.Helper()
+
+	t.Logf("(dbg) %s: waiting %s for pvc %q in namespace %q ...", t.Name(), timeout, name, ns)
+
+	f := func() (bool, error) {
+		ret, err := Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "get", "pvc", name, "-o", "jsonpath={.status.phase}", "-n", ns))
+		if err != nil {
+			t.Logf("%s: WARNING: PVC get for %q %q returned: %v", t.Name(), ns, name, err)
+			return false, nil
+		}
+
+		pvc := strings.TrimSpace(ret.Stdout.String())
+		if pvc == string(core.ClaimBound) {
+			return true, nil
+		} else if pvc == string(core.ClaimLost) {
+			return true, fmt.Errorf("PVC %q is LOST", name)
+		}
+		return false, nil
+	}
+
+	return wait.PollImmediate(1*time.Second, timeout, f)
+}
+
+// VolumeSnapshotWait waits for volume snapshot to be ready to use
+func VolumeSnapshotWait(ctx context.Context, t *testing.T, profile string, ns string, name string, timeout time.Duration) error {
+	t.Helper()
+
+	t.Logf("(dbg) %s: waiting %s for volume snapshot %q in namespace %q ...", t.Name(), timeout, name, ns)
+
+	f := func() (bool, error) {
+		res, err := Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "get", "volumesnapshot", name, "-o", "jsonpath={.status.readyToUse}", "-n", ns))
+		if err != nil {
+			t.Logf("%s: WARNING: volume snapshot get for %q %q returned: %v", t.Name(), ns, name, err)
+			return false, nil
+		}
+
+		isReady, err := strconv.ParseBool(strings.TrimSpace(res.Stdout.String()))
+		if err != nil {
+			t.Logf("%s: WARNING: volume snapshot get for %q %q returned: %v", t.Name(), ns, name, res.Stdout.String())
+			return false, nil
+		}
+
+		return isReady, nil
+	}
+
+	return wait.PollImmediate(1*time.Second, timeout, f)
 }
 
 // Status returns a minikube component status as a string
@@ -447,4 +505,168 @@ func killProcessFamily(t *testing.T, pid int) {
 			continue
 		}
 	}
+}
+
+// cpTestMinikubePath is where the test file will be located in the Minikube instance
+func cpTestMinikubePath() string {
+	return "/home/docker/cp-test.txt"
+}
+
+// cpTestLocalPath is where the test file located in host os
+func cpTestLocalPath() string {
+	return filepath.Join(*testdataDir, "cp-test.txt")
+}
+
+// testCpCmd ensures copy functionality into minikube instance.
+func testCpCmd(ctx context.Context, t *testing.T, profile string, node string) {
+	srcPath := cpTestLocalPath()
+	dstPath := cpTestMinikubePath()
+
+	cpArgv := []string{"-p", profile, "cp", srcPath}
+	if node == "" {
+		cpArgv = append(cpArgv, dstPath)
+	} else {
+		cpArgv = append(cpArgv, fmt.Sprintf("%s:%s", node, dstPath))
+	}
+
+	rr, err := Run(t, exec.CommandContext(ctx, Target(), cpArgv...))
+	if ctx.Err() == context.DeadlineExceeded {
+		t.Errorf("failed to run command by deadline. exceeded timeout : %s", rr.Command())
+	}
+	if err != nil {
+		t.Errorf("failed to run an cp command. args %q : %v", rr.Command(), err)
+	}
+
+	sshArgv := []string{"-p", profile, "ssh"}
+	if node != "" {
+		sshArgv = append(sshArgv, "-n", node)
+	}
+	sshArgv = append(sshArgv, fmt.Sprintf("sudo cat %s", dstPath))
+
+	rr, err = Run(t, exec.CommandContext(ctx, Target(), sshArgv...))
+	if ctx.Err() == context.DeadlineExceeded {
+		t.Errorf("failed to run command by deadline. exceeded timeout : %s", rr.Command())
+	}
+	if err != nil {
+		t.Errorf("failed to run an cp command. args %q : %v", rr.Command(), err)
+	}
+
+	expected, err := ioutil.ReadFile(srcPath)
+	if err != nil {
+		t.Errorf("failed to read test file 'testdata/cp-test.txt' : %v", err)
+	}
+
+	if diff := cmp.Diff(string(expected), rr.Stdout.String()); diff != "" {
+		t.Errorf("/testdata/cp-test.txt content mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// CopyFile copies the specified source file to the specified destination file.
+// Specify true for overwrite to overwrite the destination file if it already exits.
+func CopyFile(src, dst string, overwrite bool) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	if !overwrite {
+		// check if the file exists, if it does then return an error
+		_, err := os.Stat(dst)
+		if err != nil && !os.IsNotExist(err) {
+			return errors.New("won't overwrite destination file")
+		}
+	}
+
+	dstFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	_, err = io.Copy(dstFile, srcFile)
+	if err != nil {
+		return err
+	}
+
+	// flush the buffer
+	err = dstFile.Sync()
+	if err != nil {
+		return err
+	}
+
+	// copy file permissions
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+
+	err = os.Chmod(dst, srcInfo.Mode())
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// CopyDir recursively copies the specified source directory tree to the
+// specified destination.  The destination directory must not exist.  Any
+// symlinks under src are ignored.
+func CopyDir(src, dst string) error {
+	src = filepath.Clean(src)
+	dst = filepath.Clean(dst)
+
+	// verify that src is a directory
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if !srcInfo.IsDir() {
+		return fmt.Errorf("source is not a directory")
+	}
+
+	// now verify that dst doesn't exist
+	_, err = os.Stat(dst)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err == nil {
+		return fmt.Errorf("destination directory already exists")
+	}
+
+	err = os.MkdirAll(dst, srcInfo.Mode())
+	if err != nil {
+		return err
+	}
+
+	// get the collection of directory entries under src.
+	// for each entry build its corresponding path under dst.
+	entries, err := ioutil.ReadDir(src)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		// skip symlinks
+		if entry.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+
+		srcPath := filepath.Join(src, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+
+		if entry.IsDir() {
+			err = CopyDir(srcPath, dstPath)
+			if err != nil {
+				return err
+			}
+		} else {
+			err = CopyFile(srcPath, dstPath, true)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }

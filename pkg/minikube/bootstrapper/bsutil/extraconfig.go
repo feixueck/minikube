@@ -22,9 +22,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/blang/semver"
-	"github.com/golang/glog"
+	"github.com/blang/semver/v4"
 	"github.com/pkg/errors"
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/minikube/config"
 )
 
@@ -95,6 +95,21 @@ func CreateFlagsFromExtraArgs(extraOptions config.ExtraOptionSlice) string {
 	return convertToFlags(kubeadmExtraOpts)
 }
 
+// FindInvalidExtraConfigFlags returns all invalid 'extra-config' options
+func FindInvalidExtraConfigFlags(opts config.ExtraOptionSlice) []string {
+	invalidOptsMap := make(map[string]struct{})
+	var invalidOpts []string
+	for _, extraOpt := range opts {
+		if _, ok := componentToKubeadmConfigKey[extraOpt.Component]; !ok {
+			if _, ok := invalidOptsMap[extraOpt.Component]; !ok {
+				invalidOpts = append(invalidOpts, extraOpt.Component)
+				invalidOptsMap[extraOpt.Component] = struct{}{}
+			}
+		}
+	}
+	return invalidOpts
+}
+
 // extraConfigForComponent generates a map of flagname-value pairs for a k8s
 // component.
 func extraConfigForComponent(component string, opts config.ExtraOptionSlice, version semver.Version) (map[string]string, error) {
@@ -106,7 +121,7 @@ func extraConfigForComponent(component string, opts config.ExtraOptionSlice, ver
 	for _, opt := range opts {
 		if opt.Component == component {
 			if val, ok := versionedOpts[opt.Key]; ok {
-				glog.Infof("Overwriting default %s=%s with user provided %s=%s for component %s", opt.Key, val, opt.Key, opt.Value, component)
+				klog.Infof("Overwriting default %s=%s with user provided %s=%s for component %s", opt.Key, val, opt.Key, opt.Value, component)
 			}
 			versionedOpts[opt.Key] = opt.Value
 		}
@@ -133,20 +148,12 @@ func defaultOptionsForComponentAndVersion(component string, version semver.Versi
 
 // newComponentOptions creates a new componentOptions
 func newComponentOptions(opts config.ExtraOptionSlice, version semver.Version, featureGates string, cp config.Node) ([]componentOptions, error) {
+	if invalidOpts := FindInvalidExtraConfigFlags(opts); len(invalidOpts) > 0 {
+		return nil, fmt.Errorf("unknown components %v. valid components are: %v", invalidOpts, KubeadmExtraConfigOpts)
+	}
+
 	var kubeadmExtraArgs []componentOptions
-	for _, extraOpt := range opts {
-		if _, ok := componentToKubeadmConfigKey[extraOpt.Component]; !ok {
-			return nil, fmt.Errorf("unknown component %q. valid components are: %v", componentToKubeadmConfigKey, componentToKubeadmConfigKey)
-		}
-	}
-
-	keys := []string{}
-	for k := range componentToKubeadmConfigKey {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	for _, component := range keys {
+	for _, component := range KubeadmExtraConfigOpts {
 		kubeadmComponentKey := componentToKubeadmConfigKey[component]
 		if kubeadmComponentKey == "" {
 			continue

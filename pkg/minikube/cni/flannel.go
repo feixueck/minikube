@@ -17,7 +17,13 @@ limitations under the License.
 package cni
 
 import (
+	"os/exec"
+	"path/filepath"
+
+	"github.com/pkg/errors"
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/minikube/config"
+	"k8s.io/minikube/pkg/minikube/driver"
 )
 
 // From https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
@@ -637,6 +643,27 @@ func (c Flannel) String() string {
 
 // Apply enables the CNI
 func (c Flannel) Apply(r Runner) error {
+	// Mostly applicable to the 'none' driver
+	_, err := r.RunCmd(exec.Command("stat", "/opt/cni/bin/portmap"))
+	if err != nil {
+		return errors.Wrap(err, "required 'portmap' CNI plug-in not found")
+	}
+
+	if driver.IsKIC(c.cc.Driver) {
+		conflict := "/etc/cni/net.d/100-crio-bridge.conf"
+
+		_, err := r.RunCmd(exec.Command("stat", conflict))
+		if err != nil {
+			klog.Warningf("%s not found, skipping disable step: %v", conflict, err)
+			return nil
+		}
+
+		_, err = r.RunCmd(exec.Command("sudo", "mv", conflict, filepath.Join(filepath.Dir(conflict), "DISABLED-"+filepath.Base(conflict))))
+		if err != nil {
+			klog.Errorf("unable to disable %s: %v", conflict, err)
+		}
+	}
+
 	return applyManifest(c.cc, r, manifestAsset([]byte(flannelTmpl)))
 }
 

@@ -3,13 +3,14 @@
 # containerd
 #
 ################################################################################
-CONTAINERD_BIN_VERSION = v1.2.13
-CONTAINERD_BIN_COMMIT = 7ad184331fa3e55e52b890ea95e65ba581ae3429
+CONTAINERD_BIN_VERSION = v1.4.4
+CONTAINERD_BIN_COMMIT = 05f951a3781f4f2c1911b05e61c160e9c30eaa8e
 CONTAINERD_BIN_SITE = https://github.com/containerd/containerd/archive
 CONTAINERD_BIN_SOURCE = $(CONTAINERD_BIN_VERSION).tar.gz
 CONTAINERD_BIN_DEPENDENCIES = host-go libgpgme
 CONTAINERD_BIN_GOPATH = $(@D)/_output
 CONTAINERD_BIN_ENV = \
+	$(GO_TARGET_ENV) \
 	CGO_ENABLED=1 \
 	GO111MODULE=off \
 	GOPATH="$(CONTAINERD_BIN_GOPATH)" \
@@ -38,6 +39,12 @@ define CONTAINERD_BIN_INSTALL_TARGET_CMDS
 		$(TARGET_DIR)/usr/bin
 	$(INSTALL) -Dm755 \
 		$(@D)/bin/containerd-shim \
+		$(TARGET_DIR)/usr/bin
+	$(INSTALL) -Dm755 \
+		$(@D)/bin/containerd-shim-runc-v1 \
+		$(TARGET_DIR)/usr/bin
+	$(INSTALL) -Dm755 \
+		$(@D)/bin/containerd-shim-runc-v2 \
 		$(TARGET_DIR)/usr/bin
 	$(INSTALL) -Dm755 \
 		$(@D)/bin/ctr \

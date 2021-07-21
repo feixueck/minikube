@@ -22,9 +22,9 @@ import (
 	"fmt"
 	"path"
 
-	"github.com/blang/semver"
-	"github.com/golang/glog"
+	"github.com/blang/semver/v4"
 	"github.com/pkg/errors"
+	"k8s.io/klog/v2"
 	"k8s.io/minikube/pkg/minikube/bootstrapper/bsutil/ktmpl"
 	"k8s.io/minikube/pkg/minikube/cni"
 	"k8s.io/minikube/pkg/minikube/config"
@@ -61,12 +61,20 @@ func GenerateKubeadmYAML(cc config.ClusterConfig, n config.Node, r cruntime.Mana
 		nodePort = constants.APIServerPort
 	}
 
+	cgroupDriver, err := r.CGroupDriver()
+	if err != nil {
+		if !r.Active() {
+			return nil, cruntime.ErrContainerRuntimeNotRunning
+		}
+		return nil, errors.Wrap(err, "getting cgroup driver")
+	}
+
 	componentOpts, err := createExtraComponentConfig(k8s.ExtraOptions, version, componentFeatureArgs, cp)
 	if err != nil {
 		return nil, errors.Wrap(err, "generating extra component config for kubeadm")
 	}
 
-	cnm, err := cni.New(cc)
+	cnm, err := cni.New(&cc)
 	if err != nil {
 		return nil, errors.Wrap(err, "cni")
 	}
@@ -76,7 +84,7 @@ func GenerateKubeadmYAML(cc config.ClusterConfig, n config.Node, r cruntime.Mana
 	if overrideCIDR != "" {
 		podCIDR = overrideCIDR
 	}
-	glog.Infof("Using pod CIDR: %s", podCIDR)
+	klog.Infof("Using pod CIDR: %s", podCIDR)
 
 	opts := struct {
 		CertDir             string
@@ -96,6 +104,9 @@ func GenerateKubeadmYAML(cc config.ClusterConfig, n config.Node, r cruntime.Mana
 		FeatureArgs         map[string]bool
 		NoTaintMaster       bool
 		NodeIP              string
+		CgroupDriver        string
+		ClientCAFile        string
+		StaticPodPath       string
 		ControlPlaneAddress string
 		KubeProxyOptions    map[string]string
 	}{
@@ -108,7 +119,7 @@ func GenerateKubeadmYAML(cc config.ClusterConfig, n config.Node, r cruntime.Mana
 		EtcdDataDir:       EtcdDataDir(),
 		EtcdExtraArgs:     etcdExtraArgs(k8s.ExtraOptions),
 		ClusterName:       cc.Name,
-		//kubeadm uses NodeName as the --hostname-override parameter, so this needs to be the name of the machine
+		// kubeadm uses NodeName as the --hostname-override parameter, so this needs to be the name of the machine
 		NodeName:            KubeNodeName(cc, n),
 		CRISocket:           r.SocketPath(),
 		ImageRepository:     k8s.ImageRepository,
@@ -117,6 +128,9 @@ func GenerateKubeadmYAML(cc config.ClusterConfig, n config.Node, r cruntime.Mana
 		NoTaintMaster:       false, // That does not work with k8s 1.12+
 		DNSDomain:           k8s.DNSDomain,
 		NodeIP:              n.IP,
+		CgroupDriver:        cgroupDriver,
+		ClientCAFile:        path.Join(vmpath.GuestKubernetesCertsDir, "ca.crt"),
+		StaticPodPath:       vmpath.GuestManifestsDir,
 		ControlPlaneAddress: constants.ControlPlaneAlias,
 		KubeProxyOptions:    createKubeProxyOptions(k8s.ExtraOptions),
 	}
@@ -136,25 +150,36 @@ func GenerateKubeadmYAML(cc config.ClusterConfig, n config.Node, r cruntime.Mana
 	if version.GTE(semver.MustParse("1.17.0")) {
 		configTmpl = ktmpl.V1Beta2
 	}
-	glog.Infof("kubeadm options: %+v", opts)
+	klog.Infof("kubeadm options: %+v", opts)
 	if err := configTmpl.Execute(&b, opts); err != nil {
 		return nil, err
 	}
-	glog.Infof("kubeadm config:\n%s\n", b.String())
+	klog.Infof("kubeadm config:\n%s\n", b.String())
 	return b.Bytes(), nil
 }
 
 // These are the components that can be configured
 // through the "extra-config"
 const (
-	Kubelet           = "kubelet"
-	Kubeadm           = "kubeadm"
 	Apiserver         = "apiserver"
-	Scheduler         = "scheduler"
 	ControllerManager = "controller-manager"
-	Kubeproxy         = "kube-proxy"
+	Scheduler         = "scheduler"
 	Etcd              = "etcd"
+	Kubeadm           = "kubeadm"
+	Kubeproxy         = "kube-proxy"
+	Kubelet           = "kubelet"
 )
+
+// KubeadmExtraConfigOpts is a list of allowed "extra-config" components
+var KubeadmExtraConfigOpts = []string{
+	Apiserver,
+	ControllerManager,
+	Scheduler,
+	Etcd,
+	Kubeadm,
+	Kubelet,
+	Kubeproxy,
+}
 
 // InvokeKubeadm returns the invocation command for Kubeadm
 func InvokeKubeadm(version string) string {
