@@ -14,9 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Part of this code is heavily inspired/copied by the following file:
-// github.com/docker/machine/commands/env.go
-
 package shell
 
 import (
@@ -24,11 +21,20 @@ import (
 	"io"
 	"os"
 	"runtime"
-	"strings"
 	"text/template"
 
-	"github.com/docker/machine/libmachine/shell"
+	"k8s.io/minikube/pkg/libmachine/shell"
+
+	"k8s.io/minikube/pkg/minikube/constants"
 )
+
+var unsetEnvTmpl = "{{ $root := .}}" +
+	"{{ range .Unset }}" +
+	"{{ $root.UnsetPrefix }}{{ . }}{{ $root.UnsetDelimiter }}{{ $root.UnsetSuffix }}" +
+	"{{ end }}" +
+	"{{ range .Set }}" +
+	"{{ $root.SetPrefix }}{{ .Env }}{{ $root.SetDelimiter }}{{ .Value }}{{ $root.SetSuffix }}" +
+	"{{ end }}"
 
 // Config represents the shell config
 type Config struct {
@@ -72,7 +78,7 @@ var shellConfigMap = map[string]shellData{
 		unsetDelimiter: "",
 		usageHint: func(s ...interface{}) string {
 			return fmt.Sprintf(`# %s
-# & %s | Invoke-Expression
+# & %s --shell powershell | Invoke-Expression
 `, s...)
 		},
 	},
@@ -85,7 +91,7 @@ var shellConfigMap = map[string]shellData{
 		unsetDelimiter: "=",
 		usageHint: func(s ...interface{}) string {
 			return fmt.Sprintf(`REM %s
-REM @FOR /f "tokens=*" %%i IN ('%s') DO @%%i
+REM @FOR /f "tokens=*" %%i IN ('%s --shell cmd') DO @%%i
 `, s...)
 		},
 	},
@@ -107,13 +113,24 @@ REM @FOR /f "tokens=*" %%i IN ('%s') DO @%%i
 		suffix:         "\"\n",
 		delimiter:      "=\"",
 		unsetPrefix:    "unset ",
-		unsetSuffix:    "\n",
+		unsetSuffix:    ";\n",
 		unsetDelimiter: "",
 		usageHint: func(s ...interface{}) string {
 			return fmt.Sprintf(`
 # %s
 # eval $(%s)
 `, s...)
+		},
+	},
+	"tcsh": {
+		prefix:         "setenv ",
+		suffix:         "\";\n",
+		delimiter:      " \"",
+		unsetPrefix:    "unsetenv ",
+		unsetSuffix:    ";\n",
+		unsetDelimiter: "",
+		usageHint: func(s ...interface{}) string {
+			return fmt.Sprintf("\n: \"%s\"\n: eval `%s`\n", s...)
 		},
 	},
 	"none": {
@@ -123,14 +140,14 @@ REM @FOR /f "tokens=*" %%i IN ('%s') DO @%%i
 		unsetPrefix:    "",
 		unsetSuffix:    "\n",
 		unsetDelimiter: "",
-		usageHint: func(s ...interface{}) string {
+		usageHint: func(_ ...interface{}) string {
 			return ""
 		},
 	},
 }
 
 var defaultSh = "bash"
-var defaultShell shellData = shellConfigMap[defaultSh]
+var defaultShell = shellConfigMap[defaultSh]
 
 var (
 	// ForceShell forces a shell name
@@ -148,11 +165,11 @@ func Detect() (string, error) {
 }
 
 func (c EnvConfig) getShell() shellData {
-	shell, ok := shellConfigMap[c.Shell]
+	shellData, ok := shellConfigMap[c.Shell]
 	if !ok {
-		shell = defaultShell
+		shellData = defaultShell
 	}
-	return shell
+	return shellData
 }
 
 func generateUsageHint(ec EnvConfig, usgPlz, usgCmd string) string {
@@ -176,29 +193,51 @@ type EnvConfig struct {
 }
 
 // SetScript writes out a shell-compatible set script
-func SetScript(ec EnvConfig, w io.Writer, envTmpl string, data interface{}) error {
+func SetScript(w io.Writer, envTmpl string, data interface{}) error {
 	tmpl := template.Must(template.New("envConfig").Parse(envTmpl))
 	return tmpl.Execute(w, data)
 }
 
+type unsetConfigItem struct {
+	Env, Value string
+}
+type unsetConfig struct {
+	Set            []unsetConfigItem
+	Unset          []string
+	SetPrefix      string
+	SetDelimiter   string
+	SetSuffix      string
+	UnsetPrefix    string
+	UnsetDelimiter string
+	UnsetSuffix    string
+}
+
 // UnsetScript writes out a shell-compatible unset script
 func UnsetScript(ec EnvConfig, w io.Writer, vars []string) error {
-	var sb strings.Builder
 	shellCfg := ec.getShell()
-	pfx, sfx, delim := shellCfg.unsetPrefix, shellCfg.unsetSuffix, shellCfg.unsetDelimiter
-	switch ec.Shell {
-	case "cmd", "emacs", "fish":
-		break
-	case "powershell":
-		vars = []string{strings.Join(vars, " Env:\\\\")}
-	default:
-		vars = []string{strings.Join(vars, " ")}
+	cfg := unsetConfig{
+		SetPrefix:      shellCfg.prefix,
+		SetDelimiter:   shellCfg.delimiter,
+		SetSuffix:      shellCfg.suffix,
+		UnsetPrefix:    shellCfg.unsetPrefix,
+		UnsetDelimiter: shellCfg.unsetDelimiter,
+		UnsetSuffix:    shellCfg.unsetSuffix,
 	}
-	for _, v := range vars {
-		if _, err := sb.WriteString(fmt.Sprintf("%s%s%s%s", pfx, v, delim, sfx)); err != nil {
-			return err
+	var tempUnset []string
+	for _, env := range vars {
+		exEnv := constants.MinikubeExistingPrefix + env
+		if v := os.Getenv(exEnv); v == "" {
+			cfg.Unset = append(cfg.Unset, env)
+		} else {
+			cfg.Set = append(cfg.Set, unsetConfigItem{
+				Env:   env,
+				Value: v,
+			})
+			tempUnset = append(tempUnset, exEnv)
 		}
 	}
-	_, err := w.Write([]byte(sb.String()))
-	return err
+	cfg.Unset = append(cfg.Unset, tempUnset...)
+
+	tmpl := template.Must(template.New("unsetEnv").Parse(unsetEnvTmpl))
+	return tmpl.Execute(w, &cfg)
 }

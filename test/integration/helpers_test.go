@@ -26,20 +26,36 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/docker/machine/libmachine/state"
-	"github.com/shirou/gopsutil/process"
+	"github.com/google/go-cmp/cmp"
+	"github.com/shirou/gopsutil/v4/process"
 	core "k8s.io/api/core/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/minikube/pkg/kapi"
+	"k8s.io/minikube/pkg/libmachine/state"
+	"k8s.io/minikube/pkg/minikube/detect"
 )
+
+// KubectlBinary returns the name of the kubectl binary for the current OS
+func KubectlBinary() string {
+	if runtime.GOOS == "windows" {
+		return "kubectl.exe"
+	}
+	return "kubectl"
+}
 
 // RunResult stores the result of an cmd.Run call
 type RunResult struct {
@@ -85,7 +101,7 @@ func (rr RunResult) Output() string {
 	return sb.String()
 }
 
-// Run is a test helper to log a command being executed \_(ツ)_/¯
+// Run is a test helper to log a command being executed ¯\_(ツ)_/¯
 func Run(t *testing.T, cmd *exec.Cmd) (*RunResult, error) {
 	t.Helper()
 	rr := &RunResult{Args: cmd.Args}
@@ -147,14 +163,14 @@ func (ss *StartSession) Stop(t *testing.T) {
 	killProcessFamily(t, ss.cmd.Process.Pid)
 	if t.Failed() {
 		if ss.Stdout.Size() > 0 {
-			stdout, err := ioutil.ReadAll(ss.Stdout)
+			stdout, err := io.ReadAll(ss.Stdout)
 			if err != nil {
 				t.Logf("read stdout failed: %v", err)
 			}
 			t.Logf("(dbg) %s stdout:\n%s", ss.cmd.Args, stdout)
 		}
 		if ss.Stderr.Size() > 0 {
-			stderr, err := ioutil.ReadAll(ss.Stderr)
+			stderr, err := io.ReadAll(ss.Stderr)
 			if err != nil {
 				t.Logf("read stderr failed: %v", err)
 			}
@@ -168,7 +184,9 @@ func Cleanup(t *testing.T, profile string, cancel context.CancelFunc) {
 	// No helper because it makes the call log confusing.
 	if *cleanup {
 		t.Logf("Cleaning up %q profile ...", profile)
-		_, err := Run(t, exec.Command(Target(), "delete", "-p", profile))
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		_, err := Run(t, exec.CommandContext(ctx, Target(), "delete", "-p", profile))
 		if err != nil {
 			t.Logf("failed cleanup: %v", err)
 		}
@@ -213,7 +231,15 @@ func PostMortemLogs(t *testing.T, profile string, multinode ...bool) {
 	}
 
 	t.Logf("-----------------------post-mortem--------------------------------")
-
+	t.Logf("======>  post-mortem[%s]: network settings <======", t.Name())
+	hostEnv := func(k string) string {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
+		return "<empty>"
+	}
+	t.Logf("HOST ENV snapshots: PROXY env: HTTP_PROXY=%q HTTPS_PROXY=%q NO_PROXY=%q",
+		hostEnv("HTTP_PROXY"), hostEnv("HTTPS_PROXY"), hostEnv("NO_PROXY"))
 	for _, n := range nodes {
 		machine := profile
 		if n != profile {
@@ -251,18 +277,23 @@ func PostMortemLogs(t *testing.T, profile string, multinode ...bool) {
 		}
 
 		// Get non-running pods. NOTE: This does not yet contain pods which are "running", but not "ready"
-		rr, rerr := Run(t, exec.Command("kubectl", "--context", profile, "get", "po", "-o=jsonpath={.items[*].metadata.name}", "-A", "--field-selector=status.phase!=Running"))
+		rr, rerr := Run(t, exec.Command(KubectlBinary(), "--context", profile, "get", "po", "-o=jsonpath={.items[*].metadata.name}", "-A", "--field-selector=status.phase!=Running"))
 		if rerr != nil {
 			t.Logf("%s: %v", rr.Command(), rerr)
 			return
 		}
-		notRunning := strings.Split(rr.Stdout.String(), " ")
+		// strings.Split("", " ") results in [""] slice of len 1 !
+		out := strings.TrimSpace(rr.Stdout.String())
+		if len(out) == 0 {
+			continue
+		}
+		notRunning := strings.Split(out, " ")
 		t.Logf("non-running pods: %s", strings.Join(notRunning, " "))
 
 		t.Logf("======> post-mortem[%s]: describe non-running pods <======", t.Name())
 
 		args := append([]string{"--context", profile, "describe", "pod"}, notRunning...)
-		rr, rerr = Run(t, exec.Command("kubectl", args...))
+		rr, rerr = Run(t, exec.Command(KubectlBinary(), args...))
 		if rerr != nil {
 			t.Logf("%s: %v", rr.Command(), rerr)
 			return
@@ -277,7 +308,7 @@ func PostMortemLogs(t *testing.T, profile string, multinode ...bool) {
 // podStatusMsg returns a human-readable pod status, for generating debug status
 func podStatusMsg(pod core.Pod) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("%q [%s] %s", pod.ObjectMeta.GetName(), pod.ObjectMeta.GetUID(), pod.Status.Phase))
+	sb.WriteString(fmt.Sprintf("%q [%s] %s", pod.GetName(), pod.GetUID(), pod.Status.Phase))
 	for i, c := range pod.Status.Conditions {
 		if c.Reason != "" {
 			if i == 0 {
@@ -311,8 +342,8 @@ func PodWait(ctx context.Context, t *testing.T, profile string, ns string, selec
 
 	start := time.Now()
 	t.Logf("(dbg) %s: waiting %s for pods matching %q in namespace %q ...", t.Name(), timeout, selector, ns)
-	f := func() (bool, error) {
-		pods, err := client.CoreV1().Pods(ns).List(listOpts)
+	f := func(ctx context.Context) (bool, error) {
+		pods, err := client.CoreV1().Pods(ns).List(ctx, listOpts)
 		if err != nil {
 			t.Logf("%s: WARNING: pod list for %q %q returned: %v", t.Name(), ns, selector, err)
 			// Don't return the error upwards so that this is retried, in case the apiserver is rescheduled
@@ -325,7 +356,7 @@ func PodWait(ctx context.Context, t *testing.T, profile string, ns string, selec
 		}
 
 		for _, pod := range pods.Items {
-			foundNames[pod.ObjectMeta.Name] = true
+			foundNames[pod.Name] = true
 			msg := podStatusMsg(pod)
 			// Prevent spamming logs with identical messages
 			if msg != lastMsg {
@@ -356,7 +387,7 @@ func PodWait(ctx context.Context, t *testing.T, profile string, ns string, selec
 		return false, nil
 	}
 
-	err = wait.PollImmediate(1*time.Second, timeout, f)
+	err = wait.PollUntilContextTimeout(ctx, 1*time.Second, timeout, true, f)
 	names := []string{}
 	for n := range foundNames {
 		names = append(names, n)
@@ -372,7 +403,58 @@ func PodWait(ctx context.Context, t *testing.T, profile string, ns string, selec
 	return names, fmt.Errorf("%s: %v", fmt.Sprintf("%s within %s", selector, timeout), err)
 }
 
+// PVCWait waits for persistent volume claim to reach bound state
+func PVCWait(ctx context.Context, t *testing.T, profile string, ns string, name string, timeout time.Duration) error {
+	t.Helper()
+
+	t.Logf("(dbg) %s: waiting %s for pvc %q in namespace %q ...", t.Name(), timeout, name, ns)
+
+	f := func(ctx context.Context) (bool, error) {
+		ret, err := Run(t, exec.CommandContext(ctx, KubectlBinary(), "--context", profile, "get", "pvc", name, "-o", "jsonpath={.status.phase}", "-n", ns))
+		if err != nil {
+			t.Logf("%s: WARNING: PVC get for %q %q returned: %v", t.Name(), ns, name, err)
+			return false, nil
+		}
+
+		pvc := strings.TrimSpace(ret.Stdout.String())
+		if pvc == string(core.ClaimBound) {
+			return true, nil
+		} else if pvc == string(core.ClaimLost) {
+			return true, fmt.Errorf("PVC %q is LOST", name)
+		}
+		return false, nil
+	}
+
+	return wait.PollUntilContextTimeout(ctx, 1*time.Second, timeout, true, f)
+}
+
+// VolumeSnapshotWait waits for volume snapshot to be ready to use
+func VolumeSnapshotWait(ctx context.Context, t *testing.T, profile string, ns string, name string, timeout time.Duration) error {
+	t.Helper()
+
+	t.Logf("(dbg) %s: waiting %s for volume snapshot %q in namespace %q ...", t.Name(), timeout, name, ns)
+
+	f := func(ctx context.Context) (bool, error) {
+		res, err := Run(t, exec.CommandContext(ctx, KubectlBinary(), "--context", profile, "get", "volumesnapshot", name, "-o", "jsonpath={.status.readyToUse}", "-n", ns))
+		if err != nil {
+			t.Logf("%s: WARNING: volume snapshot get for %q %q returned: %v", t.Name(), ns, name, err)
+			return false, nil
+		}
+
+		isReady, err := strconv.ParseBool(strings.TrimSpace(res.Stdout.String()))
+		if err != nil {
+			t.Logf("%s: WARNING: volume snapshot get for %q %q returned: %v", t.Name(), ns, name, res.Stdout.String())
+			return false, nil
+		}
+
+		return isReady, nil
+	}
+
+	return wait.PollUntilContextTimeout(ctx, 1*time.Second, timeout, true, f)
+}
+
 // Status returns a minikube component status as a string
+// If the command outputs multiple lines, only the first line is returned to avoid https://github.com/kubernetes/minikube/issues/21326
 func Status(ctx context.Context, t *testing.T, path string, profile string, key string, node string) string {
 	t.Helper()
 	// Reminder of useful keys: "Host", "Kubelet", "APIServer"
@@ -380,7 +462,15 @@ func Status(ctx context.Context, t *testing.T, path string, profile string, key 
 	if err != nil {
 		t.Logf("status error: %v (may be ok)", err)
 	}
-	return strings.TrimSpace(rr.Stdout.String())
+	out := strings.TrimSpace(rr.Stdout.String())
+	if out == "" {
+		return out
+	}
+	// Take only the first line if multi-line (ignore warnings or extra notes)
+	if idx := strings.IndexByte(out, '\n'); idx >= 0 {
+		out = out[:idx]
+	}
+	return strings.TrimSpace(out)
 }
 
 // showPodLogs logs debug info for pods
@@ -395,14 +485,14 @@ func showPodLogs(ctx context.Context, t *testing.T, profile string, ns string, n
 	t.Logf("%s: showing logs for failed pods as of %s", t.Name(), time.Now())
 
 	for _, name := range names {
-		rr, err := Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "describe", "po", name, "-n", ns))
+		rr, err := Run(t, exec.CommandContext(ctx, KubectlBinary(), "--context", profile, "describe", "po", name, "-n", ns))
 		if err != nil {
 			t.Logf("%s: %v", rr.Command(), err)
 		} else {
 			t.Logf("(dbg) %s:\n%s", rr.Command(), rr.Stdout)
 		}
 
-		rr, err = Run(t, exec.CommandContext(ctx, "kubectl", "--context", profile, "logs", name, "-n", ns))
+		rr, err = Run(t, exec.CommandContext(ctx, KubectlBinary(), "--context", profile, "logs", name, "-n", ns))
 		if err != nil {
 			t.Logf("%s: %v", rr.Command(), err)
 		} else {
@@ -411,10 +501,33 @@ func showPodLogs(ctx context.Context, t *testing.T, profile string, ns string, n
 	}
 }
 
+// RepoRoot returns the module root by walking up from cwd until go.mod is
+// found. The compiled e2e binary is invoked from the project root (hit on
+// the first try). `go test` sets cwd to the test package, including
+// test/integration and any nested or future test package.
+func RepoRoot(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working directory: %v", err)
+	}
+	start := dir
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatalf("failed to find go.mod from %s", start)
+		}
+		dir = parent
+	}
+}
+
 // MaybeParallel sets that the test should run in parallel
 func MaybeParallel(t *testing.T) {
 	t.Helper()
-	// TODO: Allow paralellized tests on "none" that do not require independent clusters
+	// TODO: Allow parallelized tests on "none" that do not require independent clusters
 	if NoneDriver() {
 		return
 	}
@@ -446,5 +559,272 @@ func killProcessFamily(t *testing.T, pid int) {
 			t.Logf("unable to kill pid %d: %v", p.Pid, err)
 			continue
 		}
+	}
+}
+
+// cpTestMinikubePath is where the test file will be located in the Minikube instance
+func cpTestMinikubePath() string {
+	return "/home/docker/cp-test.txt"
+}
+
+// cpTestLocalPath is where the test file located in host os
+func cpTestLocalPath() string {
+	return filepath.Join(*testdataDir, "cp-test.txt")
+}
+
+func cpTestReadText(ctx context.Context, t *testing.T, profile, node, path string) string {
+	if node == "" {
+		expected, err := os.ReadFile(path)
+		if err != nil {
+			t.Errorf("failed to read test file 'testdata/cp-test.txt' : %v", err)
+		}
+		return string(expected)
+	}
+
+	sshArgv := []string{"-p", profile, "ssh", "-n", node, fmt.Sprintf("sudo cat %s", path)}
+	rr, err := Run(t, exec.CommandContext(ctx, Target(), sshArgv...))
+	if ctx.Err() == context.DeadlineExceeded {
+		t.Errorf("failed to run command by deadline. exceeded timeout : %s", rr.Command())
+	}
+	if err != nil {
+		t.Errorf("failed to run an cp command. args %q : %v", rr.Command(), err)
+	}
+
+	return rr.Stdout.String()
+}
+
+func cpTestMergePath(node, path string) string {
+	if node == "" {
+		return path
+	}
+
+	return fmt.Sprintf("%s:%s", node, path)
+}
+
+// testCpCmd ensures copy functionality into minikube instance.
+func testCpCmd(ctx context.Context, t *testing.T, profile string, srcNode, srcPath, dstNode, dstPath string) {
+	cpArgv := []string{"-p", profile, "cp", cpTestMergePath(srcNode, srcPath), cpTestMergePath(dstNode, dstPath)}
+	rr, err := Run(t, exec.CommandContext(ctx, Target(), cpArgv...))
+	if ctx.Err() == context.DeadlineExceeded {
+		t.Errorf("failed to run command by deadline. exceeded timeout : %s", rr.Command())
+	}
+	if err != nil {
+		t.Errorf("failed to run an cp command. args %q : %v", rr.Command(), err)
+	}
+
+	expected := cpTestReadText(ctx, t, profile, srcNode, srcPath)
+	var copiedText string
+	if srcNode == "" && dstNode == "" {
+		copiedText = cpTestReadText(ctx, t, profile, profile, dstPath)
+	} else {
+		copiedText = cpTestReadText(ctx, t, profile, dstNode, dstPath)
+	}
+
+	if diff := cmp.Diff(expected, copiedText); diff != "" {
+		t.Errorf("/testdata/cp-test.txt content mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// CopyFile copies the specified source file to the specified destination file.
+// Specify true for overwrite to overwrite the destination file if it already exits.
+func CopyFile(src, dst string, overwrite bool) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	if !overwrite {
+		// check if the file exists, if it does then return an error
+		_, err := os.Stat(dst)
+		if err != nil && !os.IsNotExist(err) {
+			return errors.New("won't overwrite destination file")
+		}
+	}
+
+	dstFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	_, err = io.Copy(dstFile, srcFile)
+	if err != nil {
+		return err
+	}
+
+	// flush the buffer
+	err = dstFile.Sync()
+	if err != nil {
+		return err
+	}
+
+	// copy file permissions
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+
+	err = os.Chmod(dst, srcInfo.Mode())
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// CopyDir recursively copies the specified source directory tree to the
+// specified destination.  The destination directory must not exist.  Any
+// symlinks under src are ignored.
+func CopyDir(src, dst string) error {
+	src = filepath.Clean(src)
+	dst = filepath.Clean(dst)
+
+	// verify that src is a directory
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	if !srcInfo.IsDir() {
+		return fmt.Errorf("source is not a directory")
+	}
+
+	// now verify that dst doesn't exist
+	_, err = os.Stat(dst)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err == nil {
+		return fmt.Errorf("destination directory already exists")
+	}
+
+	err = os.MkdirAll(dst, srcInfo.Mode())
+	if err != nil {
+		return err
+	}
+
+	// get the collection of directory entries under src.
+	// for each entry build its corresponding path under dst.
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		// skip symlinks
+		entryInfo, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if entryInfo.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+
+		srcPath := filepath.Join(src, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+
+		if entry.IsDir() {
+			err = CopyDir(srcPath, dstPath)
+			if err != nil {
+				return err
+			}
+		} else {
+			err = CopyFile(srcPath, dstPath, true)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// FailFast proactively stops the addon suite when Docker Hub is rate limited.
+func FailFastDockerHubRateLimited(t *testing.T) {
+	t.Helper()
+	remaining, err := detect.DockerHubRateLimitRemaining(t.Context())
+	if err != nil {
+		t.Logf("unable to check Docker Hub rate limit (continuing): %v", err)
+		return
+	}
+
+	if remaining <= 0 {
+		t.Fatalf("failing fast: Docker Hub rate limit reached (remaining=%d)", remaining)
+	}
+}
+
+// podResolve resolves name with dig. +search applies the pod search list and
+// ndots, and +short prints the addresses and nothing else.
+func podResolve(ctx context.Context, t *testing.T, pod, name string, kubectlArgs ...string) []net.IP {
+	t.Helper()
+	args := make([]string, 0, len(kubectlArgs)+8)
+	args = append(args, kubectlArgs...)
+	args = append(args, "exec", pod, "--", "dig", "+short", "+search", name)
+	rr, err := Run(t, exec.CommandContext(ctx, args[0], args[1:]...))
+	ips := digAddresses(t, rr.Stdout.String())
+	if len(ips) == 0 {
+		t.Fatalf("Pod %s could not resolve %q: %v\n%s", pod, name, err, rr.Output())
+	}
+	return ips
+}
+
+// digAddresses returns every address in dig +short output, in order.
+// A non-empty line that is not an address is logged.
+func digAddresses(t *testing.T, output string) []net.IP {
+	t.Helper()
+	var ips []net.IP
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		ip := net.ParseIP(line)
+		if ip == nil {
+			t.Logf("dig returned unexpected line %q", line)
+			continue
+		}
+		ips = append(ips, ip)
+	}
+	return ips
+}
+
+func TestDigAddresses(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   []string
+	}{
+		{
+			// dig +short +search kubernetes.default.svc.cluster.local
+			name:   "one address",
+			output: "10.96.0.1\n",
+			want:   []string{"10.96.0.1"},
+		},
+		{
+			name:   "multiple addresses",
+			output: "3.33.186.135\n15.197.167.90\n",
+			want:   []string{"3.33.186.135", "15.197.167.90"},
+		},
+		{
+			name:   "unexpected line",
+			output: "10.96.0.1\nnot-an-address\n",
+			want:   []string{"10.96.0.1"},
+		},
+		{
+			name:   "no address",
+			output: "",
+			want:   nil,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var got []string
+			for _, ip := range digAddresses(t, tc.output) {
+				got = append(got, ip.String())
+			}
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("digAddresses() mismatch (-want +got):\n%s", diff)
+			}
+		})
 	}
 }

@@ -1,4 +1,18 @@
-apiVersion: apiextensions.k8s.io/v1beta1
+# Copyright 2018 The Kubernetes Authors All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   name: ambassadorinstallations.getambassador.io
@@ -77,7 +91,7 @@ spec:
                 instead of [AES](https://www.getambassador.io/docs/latest/topics/install/).
                 Default is false which means it installs AES by default. TODO: 1.
                 AES/AOSS is not installed and the user installs using `installOSS:
-                true`, then we straightaway install AOSS. 2. AOSS is installed via
+                true`, then we straight away install AOSS. 2. AOSS is installed via
                 operator and the user sets `installOSS: false`, then we perform the
                 migration as    detailed here - https://www.getambassador.io/docs/latest/topics/install/upgrade-to-edge-stack/
                 3. AES is installed and the user sets `installOSS: true`, then we

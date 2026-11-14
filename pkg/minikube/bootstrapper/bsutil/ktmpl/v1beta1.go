@@ -65,12 +65,6 @@ etcd:
     dataDir: {{.EtcdDataDir}}
     extraArgs:
       listen-metrics-urls: http://127.0.0.1:2381,http://{{.AdvertiseAddress}}:2381
-controllerManager:
-  extraArgs:
-    "leader-elect": "false"
-scheduler:
-  extraArgs:
-    "leader-elect": "false"
 kubernetesVersion: {{.KubernetesVersion}}
 networking:
   dnsDomain: {{if .DNSDomain}}{{.DNSDomain}}{{else}}cluster.local{{end}}
@@ -79,7 +73,14 @@ networking:
 ---
 apiVersion: kubelet.config.k8s.io/v1beta1
 kind: KubeletConfiguration
-clusterDomain: "cluster.local"
+authentication:
+  x509:
+    clientCAFile: {{.ClientCAFile}}
+cgroupDriver: {{.CgroupDriver}}
+{{- range $key, $val := .KubeletConfigOpts}}
+{{$key}}: {{$val}}
+{{- end}}
+clusterDomain: "{{if .DNSDomain}}{{.DNSDomain}}{{else}}cluster.local{{end}}"
 # disable disk resource management by default
 imageGCHighThresholdPercent: 100
 evictionHard:
@@ -87,11 +88,18 @@ evictionHard:
   nodefs.inodesFree: "0%"
   imagefs.available: "0%"
 failSwapOn: false
+staticPodPath: {{.StaticPodPath}}
 ---
 apiVersion: kubeproxy.config.k8s.io/v1alpha1
 kind: KubeProxyConfiguration
 clusterCIDR: "{{.PodSubnet }}"
-metricsBindAddress: {{.AdvertiseAddress}}:10249
+metricsBindAddress: 0.0.0.0:10249
+conntrack:
+  maxPerCore: 0
+# Skip setting "net.netfilter.nf_conntrack_tcp_timeout_established"
+  tcpEstablishedTimeout: 0s
+# Skip setting "net.netfilter.nf_conntrack_tcp_timeout_close"
+  tcpCloseWaitTimeout: 0s
 {{- range $i, $val := printMapInOrder .KubeProxyOptions ": " }}
 {{$val}}
 {{- end}}

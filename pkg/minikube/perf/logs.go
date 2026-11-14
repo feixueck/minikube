@@ -18,13 +18,13 @@ package perf
 
 import (
 	"bufio"
+	"fmt"
 	"log"
 	"os/exec"
 	"strings"
 	"time"
 
-	"github.com/golang/glog"
-	"github.com/pkg/errors"
+	"k8s.io/klog/v2"
 )
 
 // timeCommandLogs runs command and watches stdout to time how long each new log takes
@@ -35,14 +35,14 @@ func timeCommandLogs(cmd *exec.Cmd) (*result, error) {
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, errors.Wrap(err, "getting stdout pipe")
+		return nil, fmt.Errorf("getting stdout pipe: %w", err)
 	}
 	scanner := bufio.NewScanner(stdout)
 	scanner.Split(bufio.ScanLines)
 
 	log.Printf("Running: %v...", cmd.Args)
 	if err := cmd.Start(); err != nil {
-		return nil, errors.Wrap(err, "starting cmd")
+		return nil, fmt.Errorf("starting cmd: %w", err)
 	}
 
 	timer := time.Now()
@@ -50,23 +50,26 @@ func timeCommandLogs(cmd *exec.Cmd) (*result, error) {
 	var timings []float64
 
 	for scanner.Scan() {
-		log := scanner.Text()
+		logData := scanner.Text()
 		// this is the time it took to complete the previous log
 		timeTaken := time.Since(timer).Seconds()
-		glog.Infof("%f: %s", timeTaken, log)
+		klog.Infof("%f: %s", timeTaken, logData)
 
 		timer = time.Now()
-		logs = append(logs, log)
+		logs = append(logs, logData)
 		timings = append(timings, timeTaken)
+	}
+	if err := scanner.Err(); err != nil {
+		klog.Warningf("failed to read command output: %v", err)
 	}
 	// add the time it took to get from the final log to finishing the command
 	timings = append(timings, time.Since(timer).Seconds())
-	for i, log := range logs {
-		r.addTimedLog(strings.Trim(log, "\n"), timings[i+1])
+	for i, lg := range logs {
+		r.addTimedLog(strings.Trim(lg, "\n"), timings[i+1])
 	}
 
 	if err := cmd.Wait(); err != nil {
-		return nil, errors.Wrap(err, "waiting for minikube")
+		return nil, fmt.Errorf("waiting for minikube: %w", err)
 	}
 	return r, nil
 }

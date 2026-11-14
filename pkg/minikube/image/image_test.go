@@ -31,10 +31,26 @@ func TestTag(t *testing.T) {
 			expected: "image:tag",
 		}, {
 			image:    "image@sha256:digest",
-			expected: "image@sha256:digest",
+			expected: "image",
 		}, {
 			image:    "image",
 			expected: "image",
+		},
+		{
+			image:    "localhost:5000/myimage:v1",
+			expected: "localhost:5000/myimage:v1",
+		}, {
+			image:    "localhost:5000/mymirror/kube-apiserver:v1.30.0",
+			expected: "localhost:5000/mymirror/kube-apiserver:v1.30.0",
+		}, {
+			image:    "registry.io:5000/path/img:v1@sha256:digest",
+			expected: "registry.io:5000/path/img:v1",
+		}, {
+			image:    "localhost:5000/myimage:v1@sha256:digest",
+			expected: "localhost:5000/myimage:v1",
+		}, {
+			image:    "localhost:5000/mymirror/kube-apiserver:v1.30.0@sha256:digest",
+			expected: "localhost:5000/mymirror/kube-apiserver:v1.30.0",
 		},
 	}
 	for _, tc := range tcs {
@@ -42,6 +58,51 @@ func TestTag(t *testing.T) {
 			actual := Tag(tc.image)
 			if actual != tc.expected {
 				t.Errorf("actual does not match expected\nActual:%v\nExpected:%v\n", actual, tc.expected)
+			}
+		})
+	}
+}
+
+func TestNormalizeImageName(t *testing.T) {
+	cases := []struct {
+		image    string
+		expected string
+	}{
+		{
+			image:    "nginx",
+			expected: "nginx:latest",
+		},
+		{
+			image:    "localhost:5000/nginx",
+			expected: "localhost:5000/nginx:latest",
+		},
+		{
+			image:    "localhost:5000/nginx:3.0",
+			expected: "localhost:5000/nginx:3.0",
+		},
+		{
+			image:    "localhost:5000/nginx:latest",
+			expected: "localhost:5000/nginx:latest",
+		},
+		{
+			image:    "docker.io/nginx",
+			expected: "docker.io/nginx:latest",
+		},
+		{
+			image:    "nginx:3.0",
+			expected: "nginx:3.0",
+		},
+		{
+			image:    "docker.io/dotnet/core/sdk",
+			expected: "docker.io/dotnet/core/sdk:latest",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.image, func(t *testing.T) {
+			got := normalizeTagName(c.image)
+			if got != c.expected {
+				t.Errorf("Normalize error: expected: %v, got: %v", c.expected, got)
 			}
 		})
 	}

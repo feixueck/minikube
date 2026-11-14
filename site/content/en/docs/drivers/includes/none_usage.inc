@@ -2,23 +2,26 @@
 
 A Linux VM with the following:
 
-* Docker
-* systemd (OpenRC based systems are also supported in v1.10+)
+* systemd or OpenRC
+* a Container Runtime Interface (CRI), such as Docker or CRI-O
+* [containernetworking-plugins]({{<ref "/docs/faq/#how-do-i-install-containernetworking-plugins-for-none-driver" >}})
+* [cri-dockerd](https://github.com/Mirantis/cri-dockerd) (Only if using Docker CRI)
 
-This VM must also meet the [kubeadm requirements.](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/)
+This VM must also meet the [kubeadm requirements](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/), such as:
 
-Kubernetes v1.18+ needs conntract to be installed on debian based machines.
-
-```shell
-    sudo apt-get install conntrack -y
-```
+* 2 CPU's
+* 2GB RAM
+* iptables (in legacy mode)
+* conntrack
+* crictl
+* cni-plugins
+* SELinux permissive
+* cgroups v1 (v2 is not yet supported by Kubernetes)
 
 ## Usage
 
-The none driver requires minikube to be run as root, until [#3760](https://github.com/kubernetes/minikube/issues/3760) can be addressed.
-
 ```shell
-sudo -E minikube start --driver=none
+minikube start --driver=none
 ```
 
 To make `none` the default driver:

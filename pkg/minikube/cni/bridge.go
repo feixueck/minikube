@@ -18,32 +18,50 @@ package cni
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"os/exec"
 	"text/template"
 
-	"github.com/pkg/errors"
 	"k8s.io/minikube/pkg/minikube/assets"
 	"k8s.io/minikube/pkg/minikube/config"
 )
 
 // bridge is what minikube defaulted to when `--enable-default-cni=true`
-// https://github.com/containernetworking/plugins/blob/master/plugins/main/bridge/README.md
+// ref: https://www.cni.dev/plugins/current/main/bridge/
+// ref: https://www.cni.dev/plugins/current/meta/portmap/
+// ref: https://www.cni.dev/plugins/current/meta/firewall/
 
+// note: "cannot set hairpin mode and promiscuous mode at the same time"
+// ref: https://github.com/containernetworking/plugins/blob/7e9ada51e751740541969e1ea5a803cbf45adcf3/plugins/main/bridge/bridge.go#L424
 var bridgeConf = template.Must(template.New("bridge").Parse(`
 {
-  "cniVersion": "0.3.1",
+  "cniVersion": "0.4.0",
   "name": "bridge",
-  "type": "bridge",
-  "bridge": "bridge",
-  "addIf": "true",
-  "isDefaultGateway": true,
-  "forceAddress": false,
-  "ipMasq": true,
-  "hairpinMode": true,
-  "ipam": {
-      "type": "host-local",
-      "subnet": "{{.PodCIDR}}"
-  }
+  "plugins": [
+    {
+      "type": "bridge",
+      "bridge": "bridge",
+      "addIf": "true",
+      "isDefaultGateway": true,
+      "forceAddress": false,
+      "ipMasq": true,
+      "hairpinMode": true,
+      "ipam": {
+          "type": "host-local",
+          "subnet": "{{.PodCIDR}}"
+      }
+    },
+    {
+      "type": "portmap",
+      "capabilities": {
+          "portMappings": true
+      }
+    },
+    {
+       "type": "firewall"
+    }
+  ]
 }
 `))
 
@@ -65,22 +83,26 @@ func (c Bridge) netconf() (assets.CopyableFile, error) {
 		return nil, err
 	}
 
-	return assets.NewMemoryAssetTarget(b.Bytes(), "/etc/cni/net.d/1-k8s.conf", "0644"), nil
+	return assets.NewMemoryAssetTarget(b.Bytes(), "/etc/cni/net.d/1-k8s.conflist", "0644"), nil
 }
 
 // Apply enables the CNI
 func (c Bridge) Apply(r Runner) error {
 	if len(c.cc.Nodes) > 1 {
-		return fmt.Errorf("bridge CNI is incompatible with multi-node clusters")
+		return errors.New("bridge CNI is incompatible with multi-node clusters")
+	}
+
+	if _, err := r.RunCmd(exec.Command("sudo", "mkdir", "-p", "/etc/cni/net.d")); err != nil {
+		return err
 	}
 
 	f, err := c.netconf()
 	if err != nil {
-		return errors.Wrap(err, "netconf")
+		return fmt.Errorf("netconf: %w", err)
 	}
 
 	if err := r.Copy(f); err != nil {
-		return errors.Wrapf(err, "copy")
+		return fmt.Errorf("copy: %w", err)
 	}
 
 	return nil
